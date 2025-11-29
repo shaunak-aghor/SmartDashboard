@@ -42,24 +42,24 @@ last_play_time = 0
 last_api_check = 0
 current_valence = 0.5
 current_energy = 0.5
+system_status = "IDLE" # Start as IDLE so music doesn't play until someone is detected
 
 def get_mood_query(valence, energy):
-    # Map Valence/Energy to Search Queries
     if energy < 0.3:
-        if valence < 0.4: return "Melancholic Ambient"
-        else:             return "Peaceful Piano Sleep"
+        if valence < 0.4: return "Dark Ambient Instrumental"     
+        else:             return "Peaceful Piano Instrumental"   
     elif energy < 0.6:
-        if valence < 0.4: return "Sad Indie Folk"
-        elif valence < 0.7: return "Lofi Hip Hop Study"
-        else:             return "Happy Acoustic Morning"
+        if valence < 0.4: return "Sad Cello Instrumental"
+        elif valence < 0.7: return "Lofi Beats Instrumental"     
+        else:             return "Acoustic Guitar Instrumental"
     elif energy < 0.8:
-        if valence < 0.4: return "Grunge Rock 90s"
-        elif valence < 0.7: return "Classic Rock Anthems"
-        else:             return "Upbeat Pop Hits"
+        if valence < 0.4: return "Post-Rock Instrumental" 
+        elif valence < 0.7: return "Synthwave Instrumental"      
+        else:             return "Upbeat Jazz Instrumental"
     else:
-        if valence < 0.4: return "Heavy Metal Workout"
-        elif valence < 0.7: return "High Tempo Techno"
-        else:             return "Summer Dance Party"
+        if valence < 0.4: return "Dark Techno Instrumental"      
+        elif valence < 0.7: return "Drum and Bass Instrumental"  
+        else:             return "Deep House Instrumental" 
 
 def play_track(uri):
     try:
@@ -82,6 +82,15 @@ def play_track(uri):
     except Exception as e:
         print(f"[Spotify] Playback Error: {e}")
 
+def pause_track():
+    try:
+        current = sp.current_playback()
+        if current and current.get('is_playing'):
+            sp.pause_playback()
+            print("[Spotify] ⏸️ Playback Paused (System Idle)")
+    except Exception as e:
+        print(f"[Spotify] Pause Error: {e}")
+
 def fetch_and_play(valence, energy):
     if not sp: return None
     
@@ -89,15 +98,12 @@ def fetch_and_play(valence, energy):
     print(f"[Spotify] Mood: '{query}' (V:{valence:.2f} E:{energy:.2f})")
     
     try:
-        # 1. Search for Playlist
         playlist_results = sp.search(q=query, type='playlist', limit=1, offset=random.randint(0, 5))
         if not playlist_results['playlists']['items']:
             playlist_results = sp.search(q=query, type='playlist', limit=1)
             
         if playlist_results['playlists']['items']:
             playlist_id = playlist_results['playlists']['items'][0]['id']
-            
-            # 2. Get Tracks
             track_results = sp.playlist_items(playlist_id, limit=20, offset=random.randint(0, 5))
             items = track_results['items']
             
@@ -134,50 +140,53 @@ def on_connect(client, userdata, flags, rc):
         client.subscribe(config.TOPIC_COMMANDS)
 
 def on_message(client, userdata, msg):
-    global last_play_time, last_api_check, current_valence, current_energy
+    global last_play_time, last_api_check, current_valence, current_energy, system_status
     if not sp: return
 
     try:
-        # 1. Handle SKIP Command (Force Play)
+        # 1. Handle Commands
         if msg.topic == config.TOPIC_COMMANDS:
             cmd = msg.payload.decode()
+            
             if cmd == "SKIP":
                 print("[Spotify] Skipping track...")
                 data = fetch_and_play(current_valence, current_energy)
                 if data:
                     client.publish(config.TOPIC_MUSIC, json.dumps(data))
                     last_play_time = time.time()
+            
+            elif cmd == "PAUSE":
+                system_status = "IDLE"
+                pause_track()
+                
+            elif cmd == "WAKE":
+                system_status = "ACTIVE"
+                print("[Spotify] System Woke Up. Ready to play.")
 
-        # 2. Handle Mood Updates (Check status, play if stopped)
+        # 2. Handle Mood Updates
         elif msg.topic == config.TOPIC_MOOD:
             payload = json.loads(msg.payload.decode())
             current_valence = payload.get("valence", 0.5)
             current_energy = payload.get("energy", 0.5)
             
-            # Only check Spotify status every 5 seconds to avoid rate limits
-            if (time.time() - last_api_check) > 5:
-                last_api_check = time.time()
-                
-                try:
-                    # Check if music is currently playing
-                    playback = sp.current_playback()
-                    is_playing = playback and playback.get('is_playing')
-                    
-                    # Logic: If NOT playing, and we haven't tried to play recently (10s cooldown)
-                    if not is_playing:
-                        if (time.time() - last_play_time) > 10:
-                            print("[Spotify] Silence detected. Starting new track...")
-                            data = fetch_and_play(current_valence, current_energy)
-                            if data:
-                                client.publish(config.TOPIC_MUSIC, json.dumps(data))
-                                last_play_time = time.time()
-                    else:
-                        # Music is playing. Do nothing. Let it finish.
-                        pass
+            # Only check status if System is ACTIVE
+            if system_status == "ACTIVE":
+                if (time.time() - last_api_check) > 5:
+                    last_api_check = time.time()
+                    try:
+                        playback = sp.current_playback()
+                        is_playing = playback and playback.get('is_playing')
                         
-                except Exception as e:
-                    print(f"[Spotify] Status Check Error: {e}")
-        
+                        # Only play if stopped AND we are active
+                        if not is_playing:
+                            if (time.time() - last_play_time) > 10:
+                                print("[Spotify] Silence detected & Active. Playing...")
+                                data = fetch_and_play(current_valence, current_energy)
+                                if data:
+                                    client.publish(config.TOPIC_MUSIC, json.dumps(data))
+                                    last_play_time = time.time()
+                    except: pass
+            
     except Exception as e:
         print(f"[Spotify] Msg Error: {e}")
 

@@ -7,64 +7,62 @@ import project_config as config
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
-creds = None
-service = None
-last_user = None
+# State
+current_service = None
+current_loaded_user = None
 last_fetch_time = 0
 
-def setup_google_calendar():
-    global creds, service
-    print("[Calendar] Authenticating with Google...")
+def get_service_for_user(user_name):
+    global current_service, current_loaded_user
     
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if user_name not in config.USER_CALENDAR_CONFIG:
+        return None
+
+    token_file = config.USER_CALENDAR_CONFIG[user_name]
+    
+    if current_loaded_user == user_name and current_service:
+        return current_service
         
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except:
-                print("[Calendar] Token expired and refresh failed.")
-                return False
-        else:
-            if not os.path.exists('credentials.json'):
-                print("[Calendar] ERROR: credentials.json not found!")
-                return False
-                
-            # This will open a browser window for login
-            # On headless Jetson, you might need to run this once on a PC 
-            # and copy the 'token.json' file over.
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-            
-        # Save the credentials for the next run
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
+    print(f"[Calendar] Switching account to: {user_name}")
+
+    creds = None
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+    else:
+        print(f"[Calendar] Error: {token_file} not found.")
+        return None
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception as e:
+            print(f"[Calendar] Token refresh failed: {e}")
+            return None
 
     try:
         service = build('calendar', 'v3', credentials=creds)
-        print("[Calendar] Service Ready ✅")
-        return True
+        current_service = service
+        current_loaded_user = user_name
+        print(f"[Calendar] Service Ready for {user_name} ✅")
+        return service
     except Exception as e:
         print(f"[Calendar] Build Error: {e}")
-        return False
+        return None
 
-def fetch_events(calendar_id):
+def fetch_events(user_name):
+    service = get_service_for_user(user_name)
     if not service: return []
     
     try:
-        print(f"[Calendar] Fetching for ID: {calendar_id}")
-        now = datetime.datetime.utcnow().isoformat() + 'Z'  # 'Z' indicates UTC time
+        print(f"[Calendar] Querying API for {user_name}...")
+        now = datetime.datetime.utcnow().isoformat() + 'Z'
         
         events_result = service.events().list(
-            calendarId=calendar_id, 
+            calendarId='primary', 
             timeMin=now,
             maxResults=3, 
             singleEvents=True,
@@ -76,7 +74,6 @@ def fetch_events(calendar_id):
         
         for event in events:
             start = event['start'].get('dateTime', event['start'].get('date'))
-            # Parse ISO format to simple time (e.g., "10:00 AM")
             try:
                 dt = datetime.datetime.fromisoformat(start.replace('Z', '+00:00'))
                 time_str = dt.strftime("%I:%M %p")
@@ -93,7 +90,10 @@ def fetch_events(calendar_id):
         
     except Exception as e:
         print(f"[Calendar] API Error: {e}")
-        return ["Error fetching calendar"]
+        # Force reload next time
+        global current_loaded_user
+        current_loaded_user = None 
+        return ["Calendar Error"]
 
 # --- MQTT ---
 def on_connect(client, userdata, flags, rc):
@@ -102,52 +102,56 @@ def on_connect(client, userdata, flags, rc):
         client.subscribe(config.TOPIC_VISION)
 
 def on_message(client, userdata, msg):
-    global last_user, last_fetch_time
+    global current_loaded_user, last_fetch_time
     
     try:
         payload = json.loads(msg.payload.decode())
-        current_user = payload.get("user", "Unknown")
+        detected_user = payload.get("user", "Unknown")
         
-        # Only fetch if user changed OR it's been 5 minutes
-        is_new_user = (current_user != last_user) and (current_user != "Unknown")
+        # 1. Handle "Unknown" / "Guest"
+        if detected_user not in config.USER_CALENDAR_CONFIG:
+            # If we were previously looking at a valid user, and now it's Unknown,
+            # we MUST reset 'current_loaded_user' to None.
+            # This ensures that when the valid user returns, it counts as a "Change"
+            if current_loaded_user is not None:
+                print(f"[Calendar] User left/lost ({current_loaded_user} -> {detected_user}). Resetting state.")
+                current_loaded_user = None
+                
+                # Optional: Send empty clear command
+                client.publish(config.TOPIC_CALENDAR, json.dumps({"user": detected_user, "events": []}))
+            return
+
+        # 2. Handle Valid User
+        # Fetch if: User is different from memory OR Timer expired (5 mins)
+        is_new_user = (detected_user != current_loaded_user)
         is_time_refresh = (time.time() - last_fetch_time) > 300
         
-        if is_new_user or (is_time_refresh and current_user != "Unknown"):
+        if is_new_user or is_time_refresh:
+            events = fetch_events(detected_user)
             
-            # Check if we have a map for this user
-            if current_user in config.CALENDAR_MAP:
-                cal_id = config.CALENDAR_MAP[current_user]
-                events = fetch_events(cal_id)
-                
-                # Publish result
-                out_payload = {
-                    "user": current_user,
-                    "events": events
-                }
-                client.publish(config.TOPIC_CALENDAR, json.dumps(out_payload))
-                print(f"[Calendar] Sent events for {current_user}")
-                
-                last_user = current_user
-                last_fetch_time = time.time()
-            else:
-                # User recognized visually, but no calendar config
-                # Don't spam updates
-                if is_new_user:
-                    print(f"[Calendar] No calendar mapped for {current_user}")
+            out_payload = {
+                "user": detected_user,
+                "events": events
+            }
+            client.publish(config.TOPIC_CALENDAR, json.dumps(out_payload))
+            
+            # Update state
+            last_fetch_time = time.time()
+            # Note: current_loaded_user is updated inside fetch_events -> get_service_for_user
+            # but we ensure it matches here to be safe
+            if not current_loaded_user: 
+                current_loaded_user = detected_user
                     
     except Exception as e:
         print(f"[Calendar] Msg Error: {e}")
 
 if __name__ == "__main__":
-    if setup_google_calendar():
-        client = mqtt.Client("CalendarNode")
-        client.on_connect = on_connect
-        client.on_message = on_message
-        
-        try:
-            client.connect(config.MQTT_BROKER, config.MQTT_PORT, 60)
-            client.loop_forever()
-        except Exception as e:
-            print(f"MQTT Error: {e}")
-    else:
-        print("[Calendar] Failed to init Google API. Check credentials.json.")
+    client = mqtt.Client("CalendarNode")
+    client.on_connect = on_connect
+    client.on_message = on_message
+    
+    try:
+        client.connect(config.MQTT_BROKER, config.MQTT_PORT, 60)
+        client.loop_forever()
+    except Exception as e:
+        print(f"MQTT Error: {e}")
